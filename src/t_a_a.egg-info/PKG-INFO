@@ -1,3 +1,26 @@
+Metadata-Version: 2.4
+Name: t-a-a
+Version: 0.1.0
+Summary: Telegram Archive Analysis - Export & Analysis of Telegram Chat
+Author: T_A_A Contributors
+License: MIT
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Information Analysis
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: beautifulsoup4>=4.12.0
+Requires-Dist: typer>=0.9.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: ruff>=0.1.0; extra == "dev"
+Requires-Dist: mypy>=1.8.0; extra == "dev"
+Dynamic: license-file
+
 # T_A_A - Telegram Archive Analysis
 
 Export & Analysis of Telegram Chat

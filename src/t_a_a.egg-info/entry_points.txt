@@ -1,0 +1,2 @@
+[console_scripts]
+t-aa = t_a_a.cli.main:app
