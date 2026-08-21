@@ -16,6 +16,10 @@ src/t_a_a/models/__init__.py
 src/t_a_a/models/domain.py
 src/t_a_a/normalization/__init__.py
 src/t_a_a/parser/__init__.py
+src/t_a_a/parser/discovery.py
+src/t_a_a/parser/exceptions.py
+src/t_a_a/parser/html_parser.py
+src/t_a_a/parser/import_result.py
 src/t_a_a/processing/__init__.py
 src/t_a_a/storage/__init__.py
 src/t_a_a/utils/__init__.py

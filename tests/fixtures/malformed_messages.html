@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="title" content="Malformed Test">
+    <title>Telegram Chat Export</title>
+</head>
+<body>
+    <h1>Malformed Messages Test</h1>
+    
+    <!-- Missing message ID -->
+    <div class="message">
+        <div class="from_name">NoIDUser</div>
+        <div class="date">Oct 1, 2024, 5:00 PM</div>
+        <div class="text">This message has no ID attribute</div>
+    </div>
+    
+    <!-- Missing timestamp -->
+    <div class="message" id="notime">
+        <div class="from_name">NoTimeUser</div>
+        <div class="text">This message has no timestamp</div>
+    </div>
+    
+    <!-- Valid message for comparison -->
+    <div class="message" id="valid1">
+        <div class="from_name">ValidUser</div>
+        <div class="date">Oct 1, 2024, 5:05 PM</div>
+        <div class="text">This is a valid message</div>
+    </div>
+</body>
+</html>

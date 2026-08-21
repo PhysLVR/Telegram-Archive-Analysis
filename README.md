@@ -1,6 +1,3 @@
-# THIS PROJECT IS NOT FINISHED, IT WILL NOT WORK UNTILL MY RELEASE 
-just a skeleton.
-
 # T_A_A - Telegram Archive Analysis
 
 Export & Analysis of Telegram Chat

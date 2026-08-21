@@ -43,11 +43,109 @@ def import_data(
     Discovers and parses Telegram export files, normalizes the data,
     and stores it in the specified output directory.
     """
-    # TODO: Implement import logic
-    typer.echo(f"Import command invoked with path: {path}")
-    typer.echo(f"Output directory: {output}")
-    if verbose:
-        typer.echo("Verbose mode enabled")
+    import logging
+
+    from t_a_a.parser import (
+        ImportResult,
+        discover_export,
+        parse_export_files,
+    )
+    from t_a_a.utils.logging_config import get_logger, set_log_level
+
+    # Setup logging
+    log_level = logging.DEBUG if verbose else logging.INFO
+    logger = get_logger(__name__, level=log_level)
+
+    try:
+        # Step 1: Discover export files
+        logger.info(f"Discovering export files in: {path}")
+        discovery_result = discover_export(path)
+
+        logger.info(f"Found {len(discovery_result.discovered_files)} HTML file(s)")
+        for warning in discovery_result.warnings:
+            logger.warning(warning)
+
+        # Step 2: Parse files and collect results
+        files_processed = 0
+        messages_parsed = 0
+        messages_skipped = 0
+        participants: set[str] = set()
+        service_messages = 0
+        attachments_found = 0
+        links_found = 0
+        earliest_timestamp = None
+        latest_timestamp = None
+
+        for message, chat_info, current_participants in parse_export_files(
+            discovery_result.discovered_files
+        ):
+            files_processed = len(discovery_result.discovered_files)
+
+            if message is None:
+                messages_skipped += 1
+                continue
+
+            messages_parsed += 1
+
+            # Track participant
+            if message.sender_display_name:
+                participants.add(message.sender_display_name)
+
+            # Count service messages
+            if message.message_type == "service":
+                service_messages += 1
+
+            # Count attachments and links
+            attachments_found += len(message.attachments)
+            links_found += len(message.links)
+
+            # Track timestamps
+            if message.timestamp:
+                if earliest_timestamp is None or message.timestamp < earliest_timestamp:
+                    earliest_timestamp = message.timestamp
+                if latest_timestamp is None or message.timestamp > latest_timestamp:
+                    latest_timestamp = message.timestamp
+
+        # Create result
+        result = ImportResult(
+            input_path=path,
+            files_processed=files_processed,
+            messages_parsed=messages_parsed,
+            messages_skipped=messages_skipped,
+            participants_discovered=len(participants),
+            service_messages=service_messages,
+            attachments_found=attachments_found,
+            links_found=links_found,
+            warnings_count=len(discovery_result.warnings),
+            errors_count=0,
+            earliest_timestamp=earliest_timestamp,
+            latest_timestamp=latest_timestamp,
+        )
+
+        # Report results
+        typer.echo("\n=== Import Complete ===")
+        typer.echo(f"Input: {path}")
+        typer.echo(f"Files processed: {result.files_processed}")
+        typer.echo(f"Messages parsed: {result.messages_parsed}")
+        typer.echo(f"Messages skipped: {result.messages_skipped}")
+        typer.echo(f"Participants: {result.participants_discovered}")
+        typer.echo(f"Service messages: {result.service_messages}")
+        typer.echo(f"Attachments: {result.attachments_found}")
+        typer.echo(f"Links: {result.links_found}")
+
+        if result.earliest_timestamp:
+            typer.echo(f"Earliest message: {result.earliest_timestamp}")
+        if result.latest_timestamp:
+            typer.echo(f"Latest message: {result.latest_timestamp}")
+
+        if not result.success:
+            typer.echo("\n⚠️  Import completed with issues")
+            raise SystemExit(1)
+
+    except Exception as e:
+        logger.error(f"Import failed: {e}")
+        typer.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
 
 
 @app.command()
