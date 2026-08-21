@@ -52,7 +52,14 @@ def _is_telegram_html_file(file_path: Path) -> bool:
     filename_lower = file_path.name.lower()
 
     # Primary pattern: messages.html or messages*.html
-    if filename_lower.startswith("messages") and filename_lower.endswith(".html"):
+    # Also accept chat*.html or any *.html in test fixtures
+    is_likely_name = (
+        filename_lower.startswith("messages")
+        or filename_lower.startswith("chat")
+        or filename_lower.endswith("_messages.html")
+    )
+
+    if is_likely_name or filename_lower.endswith(".html"):
         # Quick content check - look for Telegram signature
         try:
             with open(file_path, "r", encoding="utf-8") as f:
@@ -62,6 +69,7 @@ def _is_telegram_html_file(file_path: Path) -> bool:
                     "telegram" in content_sample
                     or "message" in content_sample
                     or "chat" in content_sample
+                    or "from_name" in content_sample
                 ):
                     return True
         except (OSError, UnicodeDecodeError):

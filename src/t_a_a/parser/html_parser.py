@@ -211,10 +211,15 @@ def _parse_message_element(
 
         # Determine message type
         message_type = "text"
-        if message_div.find(["img", "video", "audio"]):
-            message_type = "media"
-        elif message_div.find(class_=lambda x: x and "service" in str(x).lower() if x else False):
+        classes = message_div.get("class", [])
+        if isinstance(classes, str):
+            classes = [classes]
+        
+        # Check for service class
+        if any("service" in cls.lower() for cls in classes):
             message_type = "service"
+        elif message_div.find(["img", "video", "audio"]):
+            message_type = "media"
 
         # Extract attachments
         attachments = []
@@ -244,10 +249,12 @@ def _parse_message_element(
             reply_link = reply_elem.find("a", href=True)
             if reply_link:
                 href = reply_link.get("href", "")
-                # Extract message ID from link
-                match = re.search(r"message-(\d+)", href)
-                if match:
-                    reply_to_id = match.group(1)
+                # Extract message ID from link using multiple patterns
+                for pattern in [r"#message(\d+)", r"message(\d+)", r"#msg(\d+)", r"msg(\d+)"]:
+                    match = re.search(pattern, href)
+                    if match:
+                        reply_to_id = match.group(1)
+                        break
 
         # Extract forwarded-from information
         forwarded_from = None
