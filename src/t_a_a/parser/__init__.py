@@ -13,9 +13,10 @@ from .exceptions import (
     ParserError,
     ParseWarning,
     UnsupportedFormatError,
+    InvalidExportFormatError,
 )
-from .html_parser import parse_export_files, parse_telegram_html
-from .import_result import ImportResult
+from .html_parser import parse_telegram_html, parse_telegram_html_stream, TelegramHTMLStreamParser
+from .import_result import ImportResult, Message, Chat, Participant
 
 __all__ = [
     # Discovery
@@ -23,14 +24,20 @@ __all__ = [
     "discover_export",
     # Parser
     "parse_telegram_html",
-    "parse_export_files",
+    "parse_telegram_html_stream",
+    "TelegramHTMLStreamParser",
     # Result
     "ImportResult",
+    "Message",
+    "Chat",
+    "Participant",
     # Exceptions
     "ParserError",
     "InvalidInputError",
     "UnsupportedFormatError",
     "MalformedHTMLError",
     "MessageParseError",
+    "InvalidExportFormatError",
     "ParseWarning",
 ]
+
