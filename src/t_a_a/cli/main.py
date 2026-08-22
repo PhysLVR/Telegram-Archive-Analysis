@@ -41,16 +41,22 @@ def import_data(
     Import a Telegram chat export.
 
     Discovers and parses Telegram export files, normalizes the data,
-    and stores it in the specified output directory.
+    and writes an import summary to the specified output directory.
+
+    Note: Full persistent storage (SQLite) is not yet implemented; this
+    command currently parses, aggregates statistics, and saves a JSON
+    summary. Persistent storage will land in a later sprint.
     """
+    import json
     import logging
+    from pathlib import Path
 
     from t_a_a.parser import (
         ImportResult,
         discover_export,
         parse_export_files,
     )
-    from t_a_a.utils.logging_config import get_logger, set_log_level
+    from t_a_a.utils.logging_config import get_logger
 
     # Setup logging
     log_level = logging.DEBUG if verbose else logging.INFO
@@ -61,12 +67,18 @@ def import_data(
         logger.info(f"Discovering export files in: {path}")
         discovery_result = discover_export(path)
 
-        logger.info(f"Found {len(discovery_result.discovered_files)} HTML file(s)")
+        files_processed = len(discovery_result.discovered_files)
+        logger.info(f"Found {files_processed} HTML file(s)")
         for warning in discovery_result.warnings:
             logger.warning(warning)
 
+        if files_processed == 0:
+            typer.echo("No HTML export files found.", err=True)
+            raise SystemExit(1)
+
         # Step 2: Parse files and collect results
-        files_processed = 0
+        # All timestamps from the parser are timezone-aware, so comparisons
+        # across files (mixed real-TZ and legacy fixtures) are safe.
         messages_parsed = 0
         messages_skipped = 0
         participants: set[str] = set()
@@ -79,34 +91,27 @@ def import_data(
         for message, chat_info, current_participants in parse_export_files(
             discovery_result.discovered_files
         ):
-            files_processed = len(discovery_result.discovered_files)
-
             if message is None:
                 messages_skipped += 1
                 continue
 
             messages_parsed += 1
 
-            # Track participant
             if message.sender_display_name:
                 participants.add(message.sender_display_name)
 
-            # Count service messages
             if message.message_type == "service":
                 service_messages += 1
 
-            # Count attachments and links
             attachments_found += len(message.attachments)
             links_found += len(message.links)
 
-            # Track timestamps
-            if message.timestamp:
+            if message.timestamp is not None:
                 if earliest_timestamp is None or message.timestamp < earliest_timestamp:
                     earliest_timestamp = message.timestamp
                 if latest_timestamp is None or message.timestamp > latest_timestamp:
                     latest_timestamp = message.timestamp
 
-        # Create result
         result = ImportResult(
             input_path=path,
             files_processed=files_processed,
@@ -121,6 +126,16 @@ def import_data(
             earliest_timestamp=earliest_timestamp,
             latest_timestamp=latest_timestamp,
         )
+
+        # Step 3: Write import summary (storage layer not yet implemented)
+        output_dir = Path(output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = output_dir / "import_summary.json"
+        summary_path.write_text(
+            json.dumps(result.to_dict(), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        logger.info(f"Import summary written to: {summary_path}")
 
         # Report results
         typer.echo("\n=== Import Complete ===")
@@ -138,10 +153,14 @@ def import_data(
         if result.latest_timestamp:
             typer.echo(f"Latest message: {result.latest_timestamp}")
 
+        typer.echo(f"Summary: {summary_path}")
+
         if not result.success:
             typer.echo("\n⚠️  Import completed with issues")
             raise SystemExit(1)
 
+    except SystemExit:
+        raise
     except Exception as e:
         logger.error(f"Import failed: {e}")
         typer.echo(f"Error: {e}", err=True)

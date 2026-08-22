@@ -104,12 +104,14 @@ def _extract_domain(url: str) -> Optional[str]:
 def _parse_timestamp(timestamp_str: str) -> Optional[datetime]:
     """Parse a Telegram timestamp string.
 
-    Returns a timezone-aware ``datetime`` when the source string carries
-    explicit UTC offset information (the real Telegram Desktop
-    ``title="DD.MM.YYYY HH:MM:SS UTC+HH:MM"`` format). Falls back to a set
-    of naive legacy formats for backward compatibility with existing
-    fixtures/tests that do not carry timezone information; no conversion
-    to the machine's local timezone is ever performed.
+    Always returns a **timezone-aware** ``datetime`` so callers can safely
+    compare / sort timestamps across files.
+
+    * Real Telegram Desktop format
+      (``title="DD.MM.YYYY HH:MM:SS UTC±HH:MM"``) keeps the explicit offset.
+    * Legacy formats without timezone information (fixtures and older
+      exports) are treated as UTC. No conversion to the machine's local
+      timezone is ever performed.
     """
     if not timestamp_str:
         return None
@@ -129,6 +131,8 @@ def _parse_timestamp(timestamp_str: str) -> Optional[datetime]:
             tzinfo=tz,
         )
 
+    # All legacy / fallback paths below attach UTC so every returned value
+    # is timezone-aware and comparable.
     match = _US_TIMESTAMP_RE.match(text)
     if match:
         g = match.groupdict()
@@ -141,7 +145,10 @@ def _parse_timestamp(timestamp_str: str) -> Optional[datetime]:
                 hour += 12
             elif g["ampm"].upper() == "AM" and hour == 12:
                 hour = 0
-        return datetime(int(g["year"]), month, int(g["day"]), hour, int(g["minute"]))
+        return datetime(
+            int(g["year"]), month, int(g["day"]), hour, int(g["minute"]),
+            tzinfo=timezone.utc,
+        )
 
     match = _ISO_TIMESTAMP_RE.match(text)
     if match:
@@ -149,6 +156,7 @@ def _parse_timestamp(timestamp_str: str) -> Optional[datetime]:
         return datetime(
             int(g["year"]), int(g["month"]), int(g["day"]),
             int(g["hour"]), int(g["minute"]), int(g["second"] or 0),
+            tzinfo=timezone.utc,
         )
 
     match = _EUROPEAN_TIMESTAMP_RE.match(text)
@@ -157,6 +165,7 @@ def _parse_timestamp(timestamp_str: str) -> Optional[datetime]:
         return datetime(
             int(g["year"]), int(g["month"]), int(g["day"]),
             int(g["hour"]), int(g["minute"]), int(g["second"] or 0),
+            tzinfo=timezone.utc,
         )
 
     match = _EUROPEAN_SHORT_YEAR_RE.match(text)
@@ -164,7 +173,10 @@ def _parse_timestamp(timestamp_str: str) -> Optional[datetime]:
         g = match.groupdict()
         year = int(g["year"])
         year = 2000 + year if year < 50 else 1900 + year
-        return datetime(year, int(g["month"]), int(g["day"]), int(g["hour"]), int(g["minute"]))
+        return datetime(
+            year, int(g["month"]), int(g["day"]), int(g["hour"]), int(g["minute"]),
+            tzinfo=timezone.utc,
+        )
 
     return None
 

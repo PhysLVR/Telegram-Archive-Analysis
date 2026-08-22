@@ -93,16 +93,22 @@ class TestTimezoneAwareTimestamps:
         assert offset is not None
         assert offset == timedelta(0)
 
-    def test_legacy_naive_timestamp(self) -> None:
-        """Test backward compatibility with naive timestamps."""
+    def test_legacy_timestamp_treated_as_utc(self) -> None:
+        """Legacy formats without explicit offset are treated as UTC.
+
+        All timestamps returned by the parser are timezone-aware so that
+        multi-file imports can safely compare earliest/latest values.
+        """
         fixture = FIXTURES_DIR / "timezone_messages.html"
         messages = [msg for msg, _, _ in parse_telegram_html(fixture) if msg is not None]
         assert len(messages) >= 4
-        
+
         msg = messages[3]
         assert msg.timestamp is not None
-        # Legacy format should be naive (no timezone info)
-        assert msg.timestamp.tzinfo is None
+        assert msg.timestamp.tzinfo is not None
+        offset = msg.timestamp.utcoffset()
+        assert offset is not None
+        assert offset == timedelta(0)
 
 
 class TestReactions:
