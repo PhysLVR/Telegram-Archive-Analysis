@@ -80,6 +80,13 @@ _REPLY_ID_FALLBACK_RE = re.compile(r"#message(\d+)")
 # "edited Jul 10, 2024, 3:05 PM" / "edited at 3:15 PM"
 _EDITED_PREFIX_RE = re.compile(r"^edited\s+(?:at\s+)?(.+)$", re.IGNORECASE)
 
+# A bare time with no date, e.g. "3:15 PM" -- used when an "edited at ..."
+# marker gives only a time, which real Telegram Desktop exports do when
+# the edit happened the same day as the original message.
+_BARE_TIME_RE = re.compile(
+    r"^(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>AM|PM)?$", re.IGNORECASE
+)
+
 _LINK_URL_RE = re.compile(r"https?://[^\s<>\"']+")
 
 
@@ -684,7 +691,13 @@ class TelegramHTMLStreamParser(HTMLParser):
 
         forwarded_from = self._msg_forwarded_from.strip() if self._msg_forwarded_from else None
 
-        edited_at = _parse_timestamp(self._strip_edited_prefix(self._msg_edited_str)) if self._msg_edited_str else None
+        edited_at = (
+            self._resolve_edited_timestamp(
+                self._strip_edited_prefix(self._msg_edited_str), timestamp
+            )
+            if self._msg_edited_str
+            else None
+        )
 
         if self._msg_is_service:
             msg_type = "service"
@@ -729,6 +742,38 @@ class TelegramHTMLStreamParser(HTMLParser):
         text = raw.strip()
         match = _EDITED_PREFIX_RE.match(text)
         return match.group(1).strip() if match else text
+
+    @staticmethod
+    def _resolve_edited_timestamp(
+        edited_str: str, message_timestamp: Optional[datetime]
+    ) -> Optional[datetime]:
+        """Parse an edit marker's timestamp text. Handles both a full
+        date+time ("Jul 10, 2024, 3:05 PM") and a bare time-only marker
+        ("3:15 PM", which real exports use for a same-day edit) by
+        inheriting the date from the message's own already-parsed
+        timestamp in the latter case.
+        """
+        parsed = _parse_timestamp(edited_str)
+        if parsed is not None:
+            return parsed
+
+        if message_timestamp is None:
+            return None
+
+        match = _BARE_TIME_RE.match(edited_str)
+        if not match:
+            return None
+
+        hour = int(match.group("hour"))
+        minute = int(match.group("minute"))
+        ampm = match.group("ampm")
+        if ampm:
+            if ampm.upper() == "PM" and hour != 12:
+                hour += 12
+            elif ampm.upper() == "AM" and hour == 12:
+                hour = 0
+
+        return message_timestamp.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
 # ---------------------------------------------------------------------------
