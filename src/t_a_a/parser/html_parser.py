@@ -2,427 +2,856 @@
 
 This module implements a streaming parser for Telegram Desktop HTML exports.
 It uses Python's built-in HTMLParser to process large files incrementally,
-avoiding loading the entire document into memory.
+avoiding loading the entire document into memory or building a DOM.
+
+Public API:
+    parse_telegram_html: parse a single export file, yielding
+        ``(message, chat, participants)`` tuples as messages complete.
+    parse_telegram_html_stream: genuinely streaming variant that yields
+        only completed ``Message`` objects, releasing parser state as it
+        goes and never retaining the full message list.
+    parse_export_files: parse several export files (e.g. a multi-part
+        export) in sequence, yielding the same tuples as
+        ``parse_telegram_html``.
 """
 
-import re
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Iterator, Tuple, Any
-from html.parser import HTMLParser
+from __future__ import annotations
 
-from t_a_a.parser.import_result import ImportResult, Message, Chat, Participant
+import re
+import warnings
+from collections import deque
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any, Deque, Iterable, Iterator, Optional
+
+from t_a_a.models.domain import (
+    Chat,
+    Message,
+    MessageAttachment,
+    MessageLink,
+    MessageReaction,
+    Participant,
+)
 from t_a_a.parser.exceptions import InvalidExportFormatError, ParseWarning
 
+# ---------------------------------------------------------------------------
+# Regexes
+# ---------------------------------------------------------------------------
 
-def parse_telegram_html(file_path: Path) -> ImportResult:
-    """
-    Parse a Telegram HTML export file and extract messages, participants, and chat info.
+# Real Telegram Desktop timestamp, e.g. "13.02.2025 01:04:32 UTC+03:30"
+_TZ_TIMESTAMP_RE = re.compile(
+    r"^(?P<day>\d{2})\.(?P<month>\d{2})\.(?P<year>\d{4})\s+"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})\s+"
+    r"UTC(?P<sign>[+-])(?P<tz_h>\d{2}):(?P<tz_m>\d{2})$"
+)
 
-    Uses streaming parsing to handle large files efficiently.
+# Legacy/alternate formats retained for backward compatibility with the
+# existing fixtures and tests (naive datetimes, no timezone information).
+_US_TIMESTAMP_RE = re.compile(
+    r"^(?P<month>\w+)\s+(?P<day>\d{1,2}),\s+(?P<year>\d{4}),\s+"
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>AM|PM)?$",
+    re.IGNORECASE,
+)
+_EUROPEAN_TIMESTAMP_RE = re.compile(
+    r"^(?P<day>\d{2})\.(?P<month>\d{2})\.(?P<year>\d{4})\s+"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2})(?::(?P<second>\d{2}))?$"
+)
+_EUROPEAN_SHORT_YEAR_RE = re.compile(
+    r"^(?P<day>\d{2})\.(?P<month>\d{2})\.(?P<year>\d{2})\s+"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2})$"
+)
+_ISO_TIMESTAMP_RE = re.compile(
+    r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})[T ]"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2})(?::(?P<second>\d{2}))?"
+)
 
-    Args:
-        file_path: Path to the HTML export file
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
-    Returns:
-        ImportResult containing parsed data
+# Reply targets: real exports use href="#go_to_message52"; some exports
+# (and our own basic fixtures) link to "other_file.html#message100".
+_REPLY_ID_RE = re.compile(r"go_to_message(\d+)")
+_REPLY_ID_FALLBACK_RE = re.compile(r"#message(\d+)")
 
-    Raises:
-        InvalidExportFormatError: If the file format is not recognized as a Telegram export
-    """
-    parser = TelegramHTMLStreamParser()
-    
-    with open(file_path, 'r', encoding='utf-8') as f:
-        # Process in chunks to avoid loading entire file
-        while chunk := f.read(8192):
-            parser.feed(chunk)
-    
-    parser.close()
-    
-    if not parser.is_valid_export:
-        raise InvalidExportFormatError(f"File {file_path} does not appear to be a valid Telegram export")
-    
-    return ImportResult(
-        chat=parser.chat_info,
-        participants=set(parser.participants.values()),
-        messages=parser.messages
-    )
+# "edited Jul 10, 2024, 3:05 PM" / "edited at 3:15 PM"
+_EDITED_PREFIX_RE = re.compile(r"^edited\s+(?:at\s+)?(.+)$", re.IGNORECASE)
 
-
-def parse_telegram_html_stream(file_path: Path) -> Iterator[Message]:
-    """
-    Stream messages from a Telegram HTML export file.
-    
-    This generator yields messages one by one without loading the entire file.
-    
-    Args:
-        file_path: Path to the HTML export file
-        
-    Yields:
-        Message objects
-        
-    Raises:
-        InvalidExportFormatError: If the file format is not recognized
-    """
-    parser = TelegramHTMLStreamParser()
-    
-    with open(file_path, 'r', encoding='utf-8') as f:
-        while chunk := f.read(8192):
-            parser.feed(chunk)
-            # Yield messages as they are completed
-            while parser.completed_messages:
-                yield parser.completed_messages.pop(0)
-    
-    parser.close()
-    
-    # Yield any remaining messages
-    while parser.completed_messages:
-        yield parser.completed_messages.pop(0)
-    
-    if not parser.is_valid_export:
-        raise InvalidExportFormatError(f"File {file_path} does not appear to be a valid Telegram export")
+_LINK_URL_RE = re.compile(r"https?://[^\s<>\"']+")
 
 
-class TelegramHTMLStreamParser(HTMLParser):
-    """Streaming HTML parser for Telegram Desktop exports."""
-    
-    def __init__(self):
-        super().__init__()
-        
-        # State tracking
-        self.is_valid_export = False
-        self.chat_info = Chat(name="Unknown Chat", description="", type="group")
-        self.participants: Dict[str, Participant] = {}
-        self.messages: List[Message] = []
-        self.completed_messages: List[Message] = []
-        
-        # Current parsing context
-        self._in_message = False
-        self._message_depth = 0
-        self._current_message_data: Dict[str, Any] = {}
-        self._tag_stack: List[str] = []
-        self._text_buffer: List[str] = []
-        
-        # Specific element tracking
-        self._in_from_name = False
-        self._in_date = False
-        self._in_text = False
-        self._in_reply_to = False
-        self._in_forwarded = False
-        self._in_media_wrap = False
-        self._in_reaction = False
-        
-        # Temporary storage for current element
-        self._current_from_name = ""
-        self._current_timestamp_str = ""
-        self._current_reply_id: Optional[int] = None
-        self._current_media_urls: List[str] = []
-        self._current_links: List[str] = []
-        self._forwarded_from_name: Optional[str] = None
-        
-        # Store text for current message separately
-        self._current_text_parts: List[str] = []
-        
-    def feed(self, data: str) -> None:
-        """Feed data to the parser."""
-        super().feed(data)
-    
-    def close(self) -> None:
-        """Finish parsing and finalize any pending message."""
-        super().close()
-        self._finalize_current_message()
-    
-    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
-        """Handle start tags."""
-        self._tag_stack.append(tag)
-        attrs_dict = {k: v for k, v in attrs}
-        
-        # Check for Telegram export validation
-        if tag == 'title':
-            self.is_valid_export = True
-        
-        # Message container detection
-        if tag == 'div':
-            class_attr = attrs_dict.get('class', '')
-            classes = class_attr.split()
-            
-            # Check for message start (supports both "message" and "message default" formats)
-            if 'message' in classes:
-                self._start_message(attrs_dict, classes)
-                self._message_depth += 1
-            
-            # Service message detection
-            if 'service' in classes:
-                self._in_service_message = True
-            
-            # From name detection (supports both "from_name" and legacy formats)
-            if 'from_name' in classes:
-                self._in_from_name = True
-                self._current_from_name = ""
-            
-            # Date/time detection (supports both "date pull_right" and simple "date")
-            if 'date' in classes:
-                # Check for title attribute with full timestamp
-                if 'title' in attrs_dict:
-                    self._current_timestamp_str = attrs_dict['title']
-                else:
-                    self._in_date = True
-                    self._current_timestamp_str = ""
-            
-            # Reply detection
-            if 'reply_to' in classes:
-                self._in_reply_to = True
-            
-            # Forwarded message detection
-            if 'forwarded' in classes and 'body' in classes:
-                self._in_forwarded = True
-            
-            # Media wrap detection
-            if 'media_wrap' in classes:
-                self._in_media_wrap = True
-            
-            # Text content detection
-            if 'text' in classes and not self._in_reaction:
-                self._in_text = True
-        
-        # Link detection
-        elif tag == 'a':
-            href = attrs_dict.get('href', '')
-            
-            # Reply link extraction
-            if self._in_reply_to and 'go_to_message' in href:
-                # Extract message ID from href like "#go_to_message52"
-                match = re.search(r'go_to_message(\d+)', href)
-                if match:
-                    self._current_reply_id = int(match.group(1))
-            
-            # Media link extraction
-            if self._in_media_wrap:
-                if href and not href.startswith('#'):
-                    self._current_media_urls.append(href)
-            
-            # Regular link extraction (only if not in media/reply context)
-            elif href.startswith(('http://', 'https://')) and not self._in_reply_to:
-                self._current_links.append(href)
-        
-        # Image detection for media
-        elif tag == 'img':
-            if self._in_media_wrap:
-                src = attrs_dict.get('src', '')
-                if src:
-                    # Store thumbnail or media reference
-                    if not any(src in url for url in self._current_media_urls):
-                        self._current_media_urls.append(src)
-        
-        # Reaction detection to avoid contaminating text
-        elif tag == 'span':
-            class_attr = attrs_dict.get('class', '')
-            if 'reaction' in class_attr.split() or 'reactions' in class_attr.split():
-                self._in_reaction = True
-    
-    def handle_endtag(self, tag: str) -> None:
-        """Handle end tags."""
-        if self._tag_stack and self._tag_stack[-1] == tag:
-            self._tag_stack.pop()
-        
-        # Finalize message on closing div if we were in a message
-        if tag == 'div':
-            if self._in_from_name:
-                self._in_from_name = False
-            
-            if self._in_text:
-                self._in_text = False
-            
-            if self._in_media_wrap:
-                self._in_media_wrap = False
-            
-            if self._in_reply_to:
-                self._in_reply_to = False
-            
-            if self._in_forwarded:
-                self._in_forwarded = False
-            
-            if self._in_reaction:
-                self._in_reaction = False
-            
-            # Check if we're closing a message container
-            if self._in_message and self._message_depth > 0:
-                self._message_depth -= 1
-                if self._message_depth == 0:
-                    self._finalize_current_message()
-    
-    def handle_data(self, data: str) -> None:
-        """Handle text data."""
-        if self._in_from_name:
-            self._current_from_name += data
-        
-        if self._in_date:
-            self._current_timestamp_str += data
-        
-        if self._in_text and not self._in_reaction:
-            self._current_text_parts.append(data)
-        
-        # Handle text in forwarded section
-        if self._in_forwarded and self._in_from_name:
-            self._forwarded_from_name = data.strip()
-    
-    def _start_message(self, attrs_dict: Dict[str, str], classes: List[str]) -> None:
-        """Initialize parsing of a new message."""
-        self._in_message = True
-        self._current_message_data = {
-            'id': None,
-            'timestamp': None,
-            'sender_name': None,
-            'text': '',
-            'media': [],
-            'links': [],
-            'reply_to_id': None,
-            'is_service': False,
-            'forwarded_from': None
-        }
-        self._current_text_parts = []
-        self._current_media_urls = []
-        self._current_links = []
-        self._current_reply_id = None
-        self._forwarded_from_name = None
-        self._current_timestamp_str = ""
-        self._current_from_name = ""
-        
-        # Extract message ID
-        msg_id = attrs_dict.get('id', '')
-        if msg_id:
-            # Handle both "message6" and "message-999844480" formats
-            match = re.search(r'message-?(\d+)', msg_id)
-            if match:
-                self._current_message_data['id'] = int(match.group(1))
-        
-        # Check if service message
-        if 'service' in classes:
-            self._current_message_data['is_service'] = True
-    
-    def _finalize_current_message(self) -> None:
-        """Finalize the current message and add to results."""
-        if not self._in_message:
-            return
-        
-        # Get or create participant
-        sender_name = self._current_from_name.strip() if self._current_from_name else "Unknown"
-        if not sender_name:
-            sender_name = "Unknown"
-        
-        if sender_name not in self.participants:
-            # Use hash of name as ID for stability
-            participant_id = abs(hash(sender_name)) % (10**9)
-            self.participants[sender_name] = Participant(
-                id=participant_id,
-                name=sender_name
-            )
-        
-        sender = self.participants[sender_name]
-        
-        # Parse timestamp
-        timestamp = self._parse_timestamp(self._current_timestamp_str)
-        
-        # Extract text content
-        text_content = ''.join(self._current_text_parts).strip()
-        
-        # Determine message type
-        msg_type = 'text'
-        if self._current_message_data.get('is_service'):
-            msg_type = 'service'
-        elif self._current_media_urls:
-            msg_type = 'media'
-        
-        # Create message object
-        message = Message(
-            id=self._current_message_data.get('id') or abs(hash(text_content)) % (10**8),
-            timestamp=timestamp,
-            sender=sender,
-            type=msg_type,
-            text=text_content,
-            media=self._current_media_urls.copy(),
-            links=self._current_links.copy(),
-            reply_to_id=self._current_reply_id,
-            edited_at=None,  # TODO: Implement edit timestamp parsing
-            service_info={'forwarded_from': self._forwarded_from_name} if self._forwarded_from_name else None
-        )
-        
-        self.messages.append(message)
-        self.completed_messages.append(message)
-        
-        # Reset state
-        self._in_message = False
-        self._in_service_message = False
-        self._current_message_data = {}
-        self._current_text_parts = []
-    
-    def _parse_timestamp(self, timestamp_str: str) -> Optional[datetime]:
-        """Parse Telegram timestamp string with timezone support."""
-        if not timestamp_str:
-            return None
-        
-        # Telegram format: "13.02.2025 01:04:32 UTC+03:30"
-        # Extract components using regex
-        pattern = r'(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})\s+UTC([+-])(\d{2}):(\d{2})'
-        match = re.match(pattern, timestamp_str)
-        
-        if not match:
-            # Try alternative formats without timezone
-            # Format: "Jan 15, 2024, 10:30 AM"
-            alt_pattern = r'(\w+)\s+(\d+),\s+(\d{4}),\s+(\d+):(\d+)\s*(AM|PM)?'
-            alt_match = re.match(alt_pattern, timestamp_str, re.IGNORECASE)
-            if alt_match:
-                month_str, day, year, hour, minute, ampm = alt_match.groups()
-                months = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
-                         'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
-                month = months.get(month_str.lower()[:3], 1)
-                hour_int = int(hour)
-                if ampm:
-                    if ampm.upper() == 'PM' and hour_int != 12:
-                        hour_int += 12
-                    elif ampm.upper() == 'AM' and hour_int == 12:
-                        hour_int = 0
-                return datetime(int(year), month, int(day), hour_int, int(minute))
-            
-            # Try DD.MM.YY HH:MM format
-            alt_pattern2 = r'(\d{2})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2})'
-            alt_match2 = re.match(alt_pattern2, timestamp_str)
-            if alt_match2:
-                day, month, year, hour, minute = map(int, alt_match2.groups())
-                # Assume 20xx for two-digit years
-                year = 2000 + year if year < 50 else 1900 + year
-                return datetime(year, month, day, hour, minute)
-            
-            return None
-        
-        day, month, year, hour, minute, second, tz_sign, tz_hours, tz_mins = match.groups()
-        
-        # Create naive datetime
-        dt = datetime(
-            int(year), int(month), int(day),
-            int(hour), int(minute), int(second)
-        )
-        
-        # Apply timezone offset to convert to UTC
-        offset_minutes = int(tz_hours) * 60 + int(tz_mins)
-        if tz_sign == '+':
-            dt = dt - timedelta(minutes=offset_minutes)
-        else:
-            dt = dt + timedelta(minutes=offset_minutes)
-        
-        return dt
-
-
-# Legacy functions for backward compatibility
-def _extract_links_from_html(html_content: str) -> List[str]:
-    """Legacy function - extract links from HTML content."""
-    links = []
-    pattern = r'href=["\'](https?://[^"\']+)["\']'
-    matches = re.findall(pattern, html_content)
-    return list(set(matches))
+def _extract_domain(url: str) -> Optional[str]:
+    """Best-effort domain extraction without pulling in urllib for a one-liner."""
+    match = re.match(r"^https?://([^/]+)", url)
+    if not match:
+        return None
+    host = match.group(1)
+    # Strip credentials/port if present.
+    host = host.split("@")[-1].split(":")[0]
+    return host or None
 
 
 def _parse_timestamp(timestamp_str: str) -> Optional[datetime]:
-    """Legacy function - use TelegramHTMLStreamParser._parse_timestamp instead."""
-    parser = TelegramHTMLStreamParser()
-    return parser._parse_timestamp(timestamp_str)
+    """Parse a Telegram timestamp string.
+
+    Returns a timezone-aware ``datetime`` when the source string carries
+    explicit UTC offset information (the real Telegram Desktop
+    ``title="DD.MM.YYYY HH:MM:SS UTC+HH:MM"`` format). Falls back to a set
+    of naive legacy formats for backward compatibility with existing
+    fixtures/tests that do not carry timezone information; no conversion
+    to the machine's local timezone is ever performed.
+    """
+    if not timestamp_str:
+        return None
+
+    text = timestamp_str.strip()
+
+    match = _TZ_TIMESTAMP_RE.match(text)
+    if match:
+        g = match.groupdict()
+        offset = timedelta(hours=int(g["tz_h"]), minutes=int(g["tz_m"]))
+        if g["sign"] == "-":
+            offset = -offset
+        tz = timezone(offset)
+        return datetime(
+            int(g["year"]), int(g["month"]), int(g["day"]),
+            int(g["hour"]), int(g["minute"]), int(g["second"]),
+            tzinfo=tz,
+        )
+
+    match = _US_TIMESTAMP_RE.match(text)
+    if match:
+        g = match.groupdict()
+        month = _MONTHS.get(g["month"].lower()[:3])
+        if month is None:
+            return None
+        hour = int(g["hour"])
+        if g["ampm"]:
+            if g["ampm"].upper() == "PM" and hour != 12:
+                hour += 12
+            elif g["ampm"].upper() == "AM" and hour == 12:
+                hour = 0
+        return datetime(int(g["year"]), month, int(g["day"]), hour, int(g["minute"]))
+
+    match = _ISO_TIMESTAMP_RE.match(text)
+    if match:
+        g = match.groupdict()
+        return datetime(
+            int(g["year"]), int(g["month"]), int(g["day"]),
+            int(g["hour"]), int(g["minute"]), int(g["second"] or 0),
+        )
+
+    match = _EUROPEAN_TIMESTAMP_RE.match(text)
+    if match:
+        g = match.groupdict()
+        return datetime(
+            int(g["year"]), int(g["month"]), int(g["day"]),
+            int(g["hour"]), int(g["minute"]), int(g["second"] or 0),
+        )
+
+    match = _EUROPEAN_SHORT_YEAR_RE.match(text)
+    if match:
+        g = match.groupdict()
+        year = int(g["year"])
+        year = 2000 + year if year < 50 else 1900 + year
+        return datetime(year, int(g["month"]), int(g["day"]), int(g["hour"]), int(g["minute"]))
+
+    return None
+
+
+def _extract_links_from_html(html_content: str) -> list[MessageLink]:
+    """Extract links from a raw HTML snippet (legacy helper retained for tests).
+
+    Parses ``<a href="...">text</a>`` tags without building a DOM.
+    """
+    links: list[MessageLink] = []
+    seen: set[str] = set()
+    for match in re.finditer(
+        r'<a\s+[^>]*href=["\'](?P<url>[^"\']+)["\'][^>]*>(?P<text>.*?)</a>',
+        html_content,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        url = match.group("url")
+        if not url.startswith(("http://", "https://")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        text = re.sub(r"<[^>]+>", "", match.group("text")).strip()
+        links.append(MessageLink(url=url, text=text or None, domain=_extract_domain(url)))
+    return links
+
+
+# ---------------------------------------------------------------------------
+# Parse context stack
+# ---------------------------------------------------------------------------
+
+class _Frame:
+    """A single open-element frame on the parser's context stack.
+
+    Using a stack (rather than a handful of independent booleans) means
+    nested structures can never corrupt unrelated parent state: entering
+    a nested ``<div>`` pushes a new frame, and only popping that exact
+    frame on its matching close tag can change what "context" we are in.
+    """
+
+    __slots__ = ("tag", "kind", "is_message_root")
+
+    def __init__(self, tag: str, kind: Optional[str], is_message_root: bool = False) -> None:
+        self.tag = tag
+        self.kind = kind  # e.g. "message", "text", "reply", "forwarded", "media", "reaction", "from_name", "date", "edited"
+        self.is_message_root = is_message_root
+
+
+class TelegramHTMLStreamParser(HTMLParser):
+    """Streaming HTML parser for Telegram Desktop exports.
+
+    Correctness properties this parser maintains:
+      * A message is finalized only when its own root ``.message`` element
+        closes -- nested ``<div>`` elements never trigger finalization.
+        "joined" messages are still separate messages (they get their own
+        root ``.message`` element and are handled identically).
+      * Context (text / reply / forwarded / media / reaction / ...) is
+        tracked via a stack of frames, not independent booleans, so nested
+        structures (e.g. a reaction block inside a message, or a nested
+        div inside forwarded content) cannot leak into unrelated state.
+      * No DOM is built; only a bounded stack and small per-message
+        buffers are kept in memory.
+    """
+
+    def __init__(self, *, source_file: Optional[str] = None) -> None:
+        super().__init__(convert_charrefs=True)
+
+        self.is_valid_export = False
+        self._title_text = ""
+        self._chat_title: Optional[str] = None
+        self._saw_message_element = False
+
+        self.chat_info = Chat(chat_id="unknown", title="Unknown Chat", chat_type="group")
+
+        self.participants: dict[str, Participant] = {}
+        # Bounded queue of completed messages ready to be handed to the
+        # caller; using a deque (not list.pop(0)) keeps release O(1).
+        self.completed_messages: Deque[Optional[Message]] = deque()
+
+        self._source_file = source_file
+
+        # Context stack. Each entry is a _Frame.
+        self._stack: list[_Frame] = []
+
+        # State for the message currently being built (only meaningful
+        # while a message frame is on the stack).
+        self._reset_message_state()
+
+    # -- lifecycle -----------------------------------------------------
+
+    def close(self) -> None:
+        super().close()
+        # Safety net: if the stream ended with an unclosed <title> (e.g. a
+        # truncated file), still check whatever title text was captured
+        # rather than leaving validity permanently unresolved.
+        self._update_validity()
+        # If the stream ended mid-message (truncated/malformed export),
+        # do not silently fabricate a message from partial state.
+        if self._in_message():
+            warnings.warn(
+                "Telegram export ended with an unclosed message element; "
+                "discarding incomplete message.",
+                ParseWarning,
+                stacklevel=2,
+            )
+        self._stack.clear()
+
+    # -- helpers ---------------------------------------------------------
+
+    def _in_message(self) -> bool:
+        return any(f.is_message_root for f in self._stack)
+
+    def _top_kind(self) -> Optional[str]:
+        return self._stack[-1].kind if self._stack else None
+
+    def _nearest_kind(self) -> Optional[str]:
+        """The nearest enclosing meaningful frame kind, skipping plain
+        inline formatting tags (e.g. <b>, <i>, <code>, unclassed <span>)
+        that carry no kind of their own. This lets text nested inside
+        inline formatting still be attributed to its actual context
+        (message text, from_name, etc.) without those tags needing to be
+        special-cased individually.
+        """
+        for frame in reversed(self._stack):
+            if frame.kind is not None:
+                return frame.kind
+        return None
+
+    def _has_kind(self, kind: str) -> bool:
+        """True if `kind` is anywhere on the current context stack."""
+        return any(f.kind == kind for f in self._stack)
+
+    def _update_validity(self) -> None:
+        # Require real Telegram-specific structural evidence rather than
+        # the mere presence of a <title> element, which is true of
+        # virtually any HTML document. Either signal alone is sufficient:
+        # the page title Telegram Desktop writes ("Telegram Chat Export" /
+        # "Telegram Web"), or an actual .message element having been seen.
+        title_says_telegram = "telegram" in self._title_text.lower()
+        if title_says_telegram or self._saw_message_element:
+            self.is_valid_export = True
+
+    def _update_chat_info(self) -> None:
+        title = self._chat_title
+        if not title:
+            return
+        # Telegram's HTML export never embeds a numeric chat id in the
+        # markup itself (only the companion result.json does, which this
+        # parser does not read). Derive a stable id from the title so
+        # repeated parses of the same export are consistent, rather than
+        # leaving the placeholder "unknown" or inventing a random one.
+        chat_id = self.chat_info.chat_id
+        if chat_id == "unknown":
+            chat_id = title
+        self.chat_info = Chat(
+            chat_id=chat_id,
+            title=title,
+            chat_type=self.chat_info.chat_type,
+            source_files=self.chat_info.source_files,
+        )
+
+    def _reset_message_state(self) -> None:
+        self._msg_id: Optional[str] = None
+        self._msg_is_service = False
+        self._msg_timestamp_str: str = ""
+        self._msg_from_name: str = ""
+        self._msg_text_parts: list[str] = []
+        self._msg_reply_id: Optional[str] = None
+        self._msg_forwarded_from: Optional[str] = None
+        self._msg_attachments: list[MessageAttachment] = []
+        self._msg_links: list[MessageLink] = []
+        self._msg_reactions: list[MessageReaction] = []
+        self._msg_edited_str: Optional[str] = None
+        self._msg_had_media_container = False
+        # Per-reaction-item scratch state, reset whenever a new
+        # .reaction/.reaction_item element opens.
+        self._reaction_emoji: str = ""
+        self._reaction_count_str: str = ""
+
+    # -- HTMLParser overrides --------------------------------------------
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        attrs_dict: dict[str, str] = {k: v for k, v in attrs if v is not None}
+        classes = attrs_dict.get("class", "").split()
+
+        kind: Optional[str] = None
+        is_message_root = False
+
+        if tag == "title":
+            kind = "title"
+        elif tag == "meta" and attrs_dict.get("name") == "title":
+            content = attrs_dict.get("content")
+            if content:
+                self._chat_title = content
+                self._update_chat_info()
+        elif tag == "h1" and self._chat_title is None:
+            kind = "h1"
+
+        # Media wrapper classes appear on different tags depending on
+        # export version: some Telegram Desktop builds render
+        # sticker_wrap/animated_wrap/photo_wrap/video_file_wrap as a plain
+        # <div>, others as an <a href="..."> pointing at the original file
+        # (with a thumbnail <img> nested inside). Detect these by class
+        # regardless of tag so both variants are handled identically, and
+        # capture the wrapper's own href as the *original* media reference
+        # (never confused with the nested thumbnail image).
+        if tag in ("div", "a") and "sticker_wrap" in classes:
+            kind = "media"
+            self._msg_had_media_container = True
+            if not self._has_kind("reaction"):
+                href = attrs_dict.get("href")
+                self._msg_attachments.append(
+                    MessageAttachment(type="sticker", file_path=href or None)
+                )
+        elif tag in ("div", "a") and "animated_wrap" in classes:
+            kind = "media"
+            self._msg_had_media_container = True
+            if not self._has_kind("reaction"):
+                href = attrs_dict.get("href")
+                self._msg_attachments.append(
+                    MessageAttachment(type="animated", file_path=href or None)
+                )
+        elif tag in ("div", "a") and "video_file_wrap" in classes:
+            kind = "media"
+            self._msg_had_media_container = True
+            if not self._has_kind("reaction"):
+                href = attrs_dict.get("href")
+                self._msg_attachments.append(
+                    MessageAttachment(type="video", file_path=href or None)
+                )
+        elif tag in ("div", "a") and "photo_wrap" in classes:
+            kind = "media"
+            self._msg_had_media_container = True
+            if not self._has_kind("reaction"):
+                href = attrs_dict.get("href")
+                self._msg_attachments.append(
+                    MessageAttachment(type="photo", file_path=href or None)
+                )
+        elif tag == "div":
+            if "message" in classes:
+                # A new root .message element -- together with the page
+                # title this is the strongest evidence we're looking at a
+                # real Telegram export, not merely any HTML document with
+                # a <title> tag.
+                self._saw_message_element = True
+                self._update_validity()
+                # If we somehow see this while already inside a message
+                # (malformed nesting), finalize/discard the prior one
+                # defensively rather than corrupting state, then start fresh.
+                if self._in_message():
+                    warnings.warn(
+                        "Encountered a nested .message root before the "
+                        "previous message closed; finalizing the previous "
+                        "message early.",
+                        ParseWarning,
+                        stacklevel=2,
+                    )
+                    self._finalize_current_message()
+                self._reset_message_state()
+                self._msg_is_service = "service" in classes
+                msg_id = attrs_dict.get("id")
+                self._msg_id = msg_id if msg_id else None
+                kind = "message"
+                is_message_root = True
+            elif "from_name" in classes:
+                kind = "from_name"
+            elif "date" in classes:
+                title = attrs_dict.get("title")
+                if title:
+                    # The title attribute carries the authoritative,
+                    # full-precision, timezone-qualified timestamp. Use it
+                    # as-is and do not treat this element's visible text
+                    # (e.g. "01:04") as further timestamp content.
+                    self._msg_timestamp_str = title
+                    kind = None
+                else:
+                    kind = "date"
+            elif "reply_to" in classes or classes == ["reply"] or "reply" in classes:
+                kind = "reply"
+            elif "forwarded" in classes and "body" in classes:
+                kind = "forwarded"
+            elif "media_wrap" in classes:
+                kind = "media"
+                self._msg_had_media_container = True
+            elif "reactions" in classes:
+                kind = "reaction"
+            elif "reaction" in classes:
+                kind = "reaction_item"
+                self._reaction_emoji = ""
+                self._reaction_count_str = ""
+            elif "text" in classes and not self._has_kind("reaction"):
+                kind = "text"
+            elif "edited" in classes:
+                kind = "edited"
+
+        elif tag == "span":
+            if "reactions" in classes:
+                kind = "reaction"
+            elif "reaction" in classes:
+                kind = "reaction_item"
+                self._reaction_emoji = ""
+                self._reaction_count_str = ""
+            elif "emoji" in classes and self._has_kind("reaction"):
+                kind = "reaction_emoji"
+            elif "count" in classes and self._has_kind("reaction"):
+                kind = "reaction_count"
+            elif "date" in classes and self._has_kind("forwarded"):
+                # Forwarded-block date, e.g. inline <span class="date details">
+                # inside .forwarded.body -- not the current message's own date.
+                title = attrs_dict.get("title")
+                if title:
+                    pass  # forwarded date not currently surfaced by the domain model
+            elif "edited" in classes:
+                kind = "edited"
+
+        elif tag == "a":
+            href = attrs_dict.get("href", "")
+            if self._has_kind("reaction"):
+                pass  # reaction/button links never contribute text or links
+            elif self._has_kind("reply"):
+                self._extract_reply_id(href)
+            elif self._has_kind("forwarded"):
+                pass  # forwarded-subtree links are not the current message's links
+            elif self._has_kind("media"):
+                if href and not href.startswith("#"):
+                    self._add_link_attachment(href)
+            elif self._in_message() and href.startswith(("http://", "https://")):
+                self._msg_links.append(
+                    MessageLink(url=href, text=None, domain=_extract_domain(href))
+                )
+            elif self._in_message() and not self._has_kind("text") and href and not href.startswith("#"):
+                # A bare local file link directly under the message body
+                # (not inside .text, not an external link): treat as a
+                # generic file/document attachment.
+                self._add_link_attachment(href)
+
+        elif tag == "img":
+            if self._has_kind("reaction") or self._has_kind("forwarded"):
+                pass
+            elif self._has_kind("media"):
+                src = attrs_dict.get("src")
+                if src and self._msg_attachments:
+                    # The wrapper (sticker/animated/photo/video/media_wrap)
+                    # already recorded the attachment with its href as the
+                    # original file; this <img> is the thumbnail, not a
+                    # second original. Attach it to the existing entry
+                    # rather than creating a duplicate.
+                    last = self._msg_attachments[-1]
+                    metadata = dict(last.metadata)
+                    metadata.setdefault("thumbnail_path", src)
+                    self._msg_attachments[-1] = replace(last, metadata=metadata)
+                elif src and self._in_message():
+                    # A bare <img> with no wrapper at all.
+                    self._msg_attachments.append(
+                        MessageAttachment(type="photo", file_path=src)
+                    )
+
+        elif tag == "video":
+            if self._in_message() and not self._has_kind("reaction") and not self._has_kind("forwarded"):
+                src = attrs_dict.get("src")
+                if src:
+                    self._msg_attachments.append(
+                        MessageAttachment(type="video", file_path=src)
+                    )
+
+        elif tag == "br":
+            if self._has_kind("text") and not self._has_kind("reaction") and not self._has_kind("forwarded"):
+                self._msg_text_parts.append("\n")
+            # <br> inside the forwarded subtree is intentionally ignored:
+            # forwarded body text is not captured (see handle_data).
+
+        self._stack.append(_Frame(tag=tag, kind=kind, is_message_root=is_message_root))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        # Self-closing tags (e.g. <br/>, <img .../>) never get a matching
+        # handle_endtag, so route them through start-tag handling and then
+        # immediately pop -- this keeps the stack balanced without ever
+        # treating them as containers that could swallow later content.
+        self.handle_starttag(tag, attrs)
+        if self._stack:
+            self._stack.pop()
+
+    def handle_endtag(self, tag: str) -> None:
+        # Pop the innermost matching frame. HTML from real exports is not
+        # always perfectly balanced; scan from the top for the nearest
+        # frame with this tag rather than assuming stack[-1] matches, so a
+        # stray/unexpected closing tag can't desynchronize tracking of
+        # unrelated ancestors.
+        idx = None
+        for i in range(len(self._stack) - 1, -1, -1):
+            if self._stack[i].tag == tag:
+                idx = i
+                break
+        if idx is None:
+            return  # unmatched closing tag; ignore rather than corrupt state
+
+        frame = self._stack[idx]
+        del self._stack[idx:]
+
+        if frame.kind == "reaction_item":
+            self._finalize_reaction_item()
+        elif frame.kind == "title":
+            self._update_validity()
+        elif frame.kind == "h1":
+            self._update_chat_info()
+
+        if frame.is_message_root:
+            self._finalize_current_message()
+
+    def handle_data(self, data: str) -> None:
+        if not data:
+            return
+
+        nearest = self._nearest_kind()
+
+        if self._has_kind("reaction"):
+            # Only the specific emoji/count sub-elements of a reaction are
+            # meaningful; any other text inside .reactions (e.g. userpic
+            # tooltips) is discarded and never leaks into message text.
+            if nearest == "reaction_emoji":
+                self._reaction_emoji += data
+            elif nearest == "reaction_count":
+                self._reaction_count_str += data
+            return
+
+        if self._has_kind("forwarded"):
+            if nearest == "from_name":
+                self._msg_forwarded_from = ((self._msg_forwarded_from or "") + data)
+            # Forwarded body text is intentionally not captured: the
+            # domain model's forwarded_from field represents forwarded
+            # *origin* (sender), not forwarded content, and the current
+            # message's own .text (outside the forwarded subtree) is
+            # captured normally below.
+            return
+
+        if nearest == "from_name":
+            self._msg_from_name += data
+        elif nearest == "date":
+            self._msg_timestamp_str += data
+        elif nearest == "text":
+            self._msg_text_parts.append(data)
+        elif nearest == "edited":
+            self._msg_edited_str = (self._msg_edited_str or "") + data
+        elif nearest == "reply":
+            pass  # reply link text (e.g. quoted sender name) is not message text
+        elif nearest == "title":
+            self._title_text += data
+        elif nearest == "h1":
+            self._chat_title = (self._chat_title or "") + data
+
+    # -- extraction helpers -----------------------------------------------
+
+    def _extract_reply_id(self, href: str) -> None:
+        match = _REPLY_ID_RE.search(href)
+        if not match:
+            match = _REPLY_ID_FALLBACK_RE.search(href)
+        if match:
+            self._msg_reply_id = match.group(1)
+
+    def _add_link_attachment(self, href: str) -> None:
+        # A generic file link inside a media wrapper (e.g. a document).
+        self._msg_attachments.append(
+            MessageAttachment(type="file", file_name=href.rsplit("/", 1)[-1], file_path=href)
+        )
+
+    def _finalize_reaction_item(self) -> None:
+        emoji = self._reaction_emoji.strip()
+        if not emoji:
+            # Not a real reaction pill (e.g. a custom-emoji placeholder we
+            # couldn't read, or an unrelated element that happened to match
+            # class "reaction"); nothing usable to record.
+            self._reaction_emoji = ""
+            self._reaction_count_str = ""
+            return
+        count_str = self._reaction_count_str.strip()
+        try:
+            count = int(count_str) if count_str else 1
+        except ValueError:
+            count = 1
+        self._msg_reactions.append(MessageReaction(emoji=emoji, count=count))
+        self._reaction_emoji = ""
+        self._reaction_count_str = ""
+
+    # -- message finalization ----------------------------------------------
+
+    def _finalize_current_message(self) -> None:
+        msg_id = self._msg_id
+        if not msg_id:
+            warnings.warn(
+                "Skipping message with no usable id attribute.",
+                ParseWarning,
+                stacklevel=2,
+            )
+            self.completed_messages.append(None)
+            self._reset_message_state()
+            return
+
+        timestamp = _parse_timestamp(self._msg_timestamp_str)
+        if timestamp is None:
+            warnings.warn(
+                f"Skipping message {msg_id!r} with missing or unparsable timestamp.",
+                ParseWarning,
+                stacklevel=2,
+            )
+            self.completed_messages.append(None)
+            self._reset_message_state()
+            return
+
+        sender_name = self._msg_from_name.strip()
+        sender_id: Optional[str] = None
+        sender_display_name: Optional[str] = None
+        if sender_name:
+            sender_display_name = sender_name
+            sender_id = sender_name  # deterministic, repository-consistent: name is the stable key
+            if sender_name not in self.participants:
+                self.participants[sender_name] = Participant(
+                    id=sender_id, display_name=sender_name
+                )
+
+        text_content = "".join(self._msg_text_parts)
+        text_content = text_content.strip("\n") if text_content else text_content
+        if text_content == "":
+            text_content = None
+
+        forwarded_from = self._msg_forwarded_from.strip() if self._msg_forwarded_from else None
+
+        edited_at = _parse_timestamp(self._strip_edited_prefix(self._msg_edited_str)) if self._msg_edited_str else None
+
+        if self._msg_is_service:
+            msg_type = "service"
+        elif self._msg_attachments:
+            msg_type = "media"
+        else:
+            msg_type = "text"
+
+        try:
+            message = Message(
+                message_id=msg_id,
+                timestamp=timestamp,
+                sender_id=sender_id,
+                sender_display_name=sender_display_name,
+                message_type=msg_type,
+                text_content=text_content,
+                reply_to_id=self._msg_reply_id,
+                forwarded_from=forwarded_from,
+                edited_at=edited_at,
+                reactions=list(self._msg_reactions),
+                attachments=list(self._msg_attachments),
+                links=list(self._msg_links),
+                source_file=self._source_file,
+            )
+        except ValueError as exc:
+            warnings.warn(
+                f"Skipping malformed message {msg_id!r}: {exc}",
+                ParseWarning,
+                stacklevel=2,
+            )
+            self.completed_messages.append(None)
+            self._reset_message_state()
+            return
+
+        self.completed_messages.append(message)
+        self._reset_message_state()
+
+    @staticmethod
+    def _strip_edited_prefix(raw: Optional[str]) -> str:
+        if not raw:
+            return ""
+        text = raw.strip()
+        match = _EDITED_PREFIX_RE.match(text)
+        return match.group(1).strip() if match else text
+
+
+# ---------------------------------------------------------------------------
+# Public functional API
+# ---------------------------------------------------------------------------
+
+_CHUNK_SIZE = 8192
+
+
+def _iter_parse(
+    file_path: Path | str,
+) -> Iterator[tuple[Optional[Message], Chat, list[Participant]]]:
+    """Shared driving loop for a single file: feed chunks, drain completed
+    messages as they're produced. Genuinely streams -- never reads or
+    buffers the whole file, and releases each message as soon as it is
+    available rather than accumulating them all before yielding.
+    """
+    path = Path(file_path)
+    source_file = str(path)
+    parser = TelegramHTMLStreamParser(source_file=source_file)
+
+    with open(path, "r", encoding="utf-8") as f:
+        while True:
+            chunk = f.read(_CHUNK_SIZE)
+            if not chunk:
+                break
+            parser.feed(chunk)
+            while parser.completed_messages:
+                message = parser.completed_messages.popleft()
+                yield message, parser.chat_info, list(parser.participants.values())
+
+    parser.close()
+    while parser.completed_messages:
+        message = parser.completed_messages.popleft()
+        yield message, parser.chat_info, list(parser.participants.values())
+
+    if not parser.is_valid_export:
+        raise InvalidExportFormatError(
+            f"File {file_path} does not appear to be a valid Telegram export"
+        )
+
+
+def parse_telegram_html(
+    file_path: Path | str,
+) -> Iterator[tuple[Optional[Message], Chat, list[Participant]]]:
+    """Parse a Telegram HTML export file.
+
+    Streams the file in chunks (never loading it fully into memory or
+    building a DOM) and yields ``(message, chat, participants)`` for every
+    completed message. ``message`` is ``None`` for a message that could
+    not be parsed (a ``ParseWarning`` is emitted in that case); this lets
+    one malformed message get skipped without aborting the whole export.
+
+    Args:
+        file_path: Path to the HTML export file.
+
+    Yields:
+        Tuples of (message or None, chat info so far, participants so far).
+
+    Raises:
+        InvalidExportFormatError: If the file does not look like a valid
+            Telegram export (no ``<title>`` element was found).
+    """
+    yield from _iter_parse(file_path)
+
+
+def parse_telegram_html_stream(file_path: Path | str) -> Iterator[Message]:
+    """Stream only the successfully parsed messages from an export file.
+
+    Unlike :func:`parse_telegram_html`, this does not report per-message
+    parse failures via ``None`` entries or return chat/participant
+    snapshots -- it is meant for callers that only need the message
+    stream itself and want the leanest possible memory footprint.
+    """
+    for message, _chat, _participants in _iter_parse(file_path):
+        if message is not None:
+            yield message
+
+
+def parse_export_files(
+    file_paths: Iterable[Path | str],
+) -> Iterator[tuple[Optional[Message], Chat, list[Participant]]]:
+    """Parse multiple Telegram export files (e.g. a multi-part export).
+
+    Files are parsed in the given order. Each file gets its own parser
+    instance (so per-file chat metadata such as the source title is
+    correctly scoped), but participants are merged across files by
+    display name and the running merged set is yielded alongside each
+    message, along with a ``Chat`` whose ``source_files`` accumulates
+    every file processed so far.
+
+    Args:
+        file_paths: Paths to the HTML export files, in the order they
+            should be parsed.
+
+    Yields:
+        Tuples of (message or None, chat info so far, participants so far).
+    """
+    merged_participants: dict[str, Participant] = {}
+    source_files: list[str] = []
+    chat_title: Optional[str] = None
+    chat_id = "unknown"
+    chat_type = "group"
+
+    for file_path in file_paths:
+        path = Path(file_path)
+        source_files.append(str(path))
+        for message, chat_info, _file_participants in _iter_parse(path):
+            if chat_title is None and chat_info.title != "Unknown Chat":
+                chat_title = chat_info.title
+                chat_id = chat_info.chat_id
+                chat_type = chat_info.chat_type
+
+            if message is not None and message.sender_display_name:
+                if message.sender_display_name not in merged_participants:
+                    merged_participants[message.sender_display_name] = Participant(
+                        id=message.sender_id, display_name=message.sender_display_name
+                    )
+
+            merged_chat = Chat(
+                chat_id=chat_id,
+                title=chat_title or "Unknown Chat",
+                chat_type=chat_type,
+                source_files=list(source_files),
+            )
+            yield message, merged_chat, list(merged_participants.values())
