@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head><title>RTL/Unicode Sender Names Test (SYNTHETIC)</title></head>
+<body>
+<div class="chatlog">
+    <!-- Persian sender name -->
+    <div id="message40" class="message default clearfix">
+        <div class="from_name">علی رضایی</div>
+        <div class="pull_right date details" title="18.02.2025 10:00:00 UTC+03:30">10:00</div>
+        <div class="text">سلام! این یک پیام تستی است.</div>
+    </div>
+    
+    <!-- Arabic sender name -->
+    <div id="message41" class="message default clearfix">
+        <div class="from_name">محمد الأحمد</div>
+        <div class="pull_right date details" title="18.02.2025 10:01:00 UTC+03:30">10:01</div>
+        <div class="text">مرحبا! هذا رسالة اختبار.</div>
+    </div>
+    
+    <!-- Mixed RTL/LTR with emoji -->
+    <div id="message42" class="message default clearfix">
+        <div class="from_name">Ahmed أحمد</div>
+        <div class="pull_right date details" title="18.02.2025 10:02:00 UTC+03:30">10:02</div>
+        <div class="text">Hello مرحبا! Testing mixed text 🌍</div>
+    </div>
+    
+    <!-- Chinese sender name -->
+    <div id="message43" class="message default clearfix">
+        <div class="from_name">李明</div>
+        <div class="pull_right date details" title="18.02.2025 10:03:00 UTC+08:00">10:03</div>
+        <div class="text">你好！这是一个测试消息。</div>
+    </div>
+    
+    <!-- Russian sender name (Cyrillic) -->
+    <div id="message44" class="message default clearfix">
+        <div class="from_name">Иван Петров</div>
+        <div class="pull_right date details" title="18.02.2025 10:04:00 UTC+03:00">10:04</div>
+        <div class="text">Привет! Это тестовое сообщение.</div>
+    </div>
+    
+    <!-- Emoji-only sender name (edge case) -->
+    <div id="message45" class="message default clearfix">
+        <div class="from_name">🎉🚀</div>
+        <div class="pull_right date details" title="18.02.2025 10:05:00 UTC+00:00">10:05</div>
+        <div class="text">Emoji sender test!</div>
+    </div>
+    
+    <!-- Deleted Account -->
+    <div id="message46" class="message default clearfix">
+        <div class="from_name">Deleted Account</div>
+        <div class="pull_right date details" title="18.02.2025 10:06:00 UTC+00:00">10:06</div>
+        <div class="text">Message from deleted account</div>
+    </div>
+</div>
+</body>
+</html>

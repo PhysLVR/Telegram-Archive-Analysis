@@ -15,8 +15,14 @@ from .exceptions import (
     UnsupportedFormatError,
     InvalidExportFormatError,
 )
-from .html_parser import parse_telegram_html, parse_telegram_html_stream, TelegramHTMLStreamParser
-from .import_result import ImportResult, Message, Chat, Participant
+from .html_parser import (
+    parse_telegram_html,
+    parse_telegram_html_stream,
+    parse_export_files,
+    TelegramHTMLStreamParser,
+)
+from .import_result import ImportResult
+from t_a_a.models.domain import Message, Chat, Participant
 
 __all__ = [
     # Discovery
@@ -25,6 +31,7 @@ __all__ = [
     # Parser
     "parse_telegram_html",
     "parse_telegram_html_stream",
+    "parse_export_files",
     "TelegramHTMLStreamParser",
     # Result
     "ImportResult",

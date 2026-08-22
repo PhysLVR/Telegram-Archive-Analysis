@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head><title>Timezone-Aware Timestamps Test (SYNTHETIC)</title></head>
+<body>
+<div class="chatlog">
+    <!-- Real Telegram Desktop format: DD.MM.YYYY HH:MM:SS UTC+HH:MM -->
+    <div id="message1" class="message default clearfix">
+        <div class="from_name">Alice</div>
+        <div class="pull_right date details" title="13.02.2025 01:04:32 UTC+03:30">01:04</div>
+        <div class="text">Message with timezone-aware timestamp UTC+03:30</div>
+    </div>
+    
+    <div id="message2" class="message default clearfix">
+        <div class="from_name">Bob</div>
+        <div class="pull_right date details" title="13.02.2025 22:49:26 UTC-05:00">22:49</div>
+        <div class="text">Message with timezone-aware timestamp UTC-05:00</div>
+    </div>
+    
+    <div id="message3" class="message default clearfix">
+        <div class="from_name">Charlie</div>
+        <div class="pull_right date details" title="14.02.2025 12:30:00 UTC+00:00">12:30</div>
+        <div class="text">Message with UTC timezone</div>
+    </div>
+    
+    <!-- Legacy format without timezone (for backward compatibility) -->
+    <div id="message4" class="message default clearfix">
+        <div class="from_name">Alice</div>
+        <div class="pull_right date details" title="14.02.2025 15:45:00">15:45</div>
+        <div class="text">Legacy format without timezone info</div>
+    </div>
+</div>
+</body>
+</html>

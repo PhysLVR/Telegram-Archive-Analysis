@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head><title>Document/File Attachments Test (SYNTHETIC)</title></head>
+<body>
+<div class="chatlog">
+    <!-- Message with document attachment -->
+    <div id="message30" class="message default clearfix">
+        <div class="from_name">Alice</div>
+        <div class="pull_right date details" title="17.02.2025 09:00:00 UTC+03:30">09:00</div>
+        
+        <div class="media_wrap clearfix">
+            <a href="documents/report.pdf">
+                <div class="document">
+                    <span class="filename">report.pdf</span>
+                </div>
+            </a>
+        </div>
+        
+        <div class="text">Here's the report you requested.</div>
+    </div>
+    
+    <!-- Message with multiple file types -->
+    <div id="message31" class="message default clearfix">
+        <div class="from_name">Bob</div>
+        <div class="pull_right date details" title="17.02.2025 09:01:00 UTC+03:30">09:01</div>
+        
+        <div class="text">Sending multiple files:</div>
+        
+        <a href="documents/data.xlsx">data.xlsx</a>
+        <a href="documents/presentation.pptx">presentation.pptx</a>
+    </div>
+    
+    <!-- Message with just a text link (not an attachment) -->
+    <div id="message32" class="message default clearfix">
+        <div class="from_name">Charlie</div>
+        <div class="pull_right date details" title="17.02.2025 09:02:00 UTC+03:30">09:02</div>
+        <div class="text">Check out this link: <a href="https://example.com/document.docx">Example Document</a></div>
+    </div>
+</div>
+</body>
+</html>

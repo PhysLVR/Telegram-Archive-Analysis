@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head><title>Forwarded Messages Test (SYNTHETIC)</title></head>
+<body>
+<div class="chatlog">
+    <!-- Message with forwarded content -->
+    <div id="message20" class="message default clearfix">
+        <div class="from_name">Alice</div>
+        <div class="pull_right date details" title="16.02.2025 11:00:00 UTC+03:30">11:00</div>
+        
+        <div class="forwarded body">
+            <div class="from_name">
+                ↻ DIGI ANTI ⇦
+                <span class="date details" title="15.02.2025 20:30:00 UTC+03:30">15.02.2025 20:30</span>
+            </div>
+        </div>
+        
+        <div class="text">Check out this forwarded message!</div>
+    </div>
+    
+    <!-- Message with forwarded from deleted account -->
+    <div id="message21" class="message default clearfix">
+        <div class="from_name">Bob</div>
+        <div class="pull_right date details" title="16.02.2025 11:01:00 UTC+03:30">11:01</div>
+        
+        <div class="forwarded body">
+            <div class="from_name">Deleted Account</div>
+        </div>
+        
+        <div class="text">Forwarded from a deleted account</div>
+    </div>
+    
+    <!-- Regular message without forwarding -->
+    <div id="message22" class="message default clearfix">
+        <div class="from_name">Charlie</div>
+        <div class="pull_right date details" title="16.02.2025 11:02:00 UTC+03:30">11:02</div>
+        <div class="text">This is a regular message, not forwarded</div>
+    </div>
+</div>
+</body>
+</html>
